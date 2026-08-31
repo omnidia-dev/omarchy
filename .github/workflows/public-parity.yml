@@ -1,0 +1,31 @@
+name: Public parity
+
+"on":
+  pull_request:
+  push:
+    branches:
+      - quattro
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  parity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
+      - name: Fetch canonical Quattro
+        run: |
+          git remote add upstream https://github.com/omacom/omarchy.git
+          git fetch --no-tags upstream quattro:refs/remotes/upstream/quattro
+      - name: Run public parity gate
+        env:
+          UPSTREAM_REF: upstream/quattro
+        run: test/public-parity

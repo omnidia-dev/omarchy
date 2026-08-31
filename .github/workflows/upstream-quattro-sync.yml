@@ -1,0 +1,83 @@
+name: Upstream Quattro sync
+
+"on":
+  schedule:
+    - cron: "17 13 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-quattro-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  prepare-sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out fork Quattro
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: quattro
+          fetch-depth: 0
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
+      - name: Fetch canonical Quattro
+        run: |
+          git remote add upstream https://github.com/omacom/omarchy.git
+          git fetch --no-tags upstream quattro:refs/remotes/upstream/quattro
+      - name: Prepare exact upstream merge
+        id: sync
+        run: |
+          set_output() {
+            printf '%s\n' "$@" >>"$GITHUB_OUTPUT"
+          }
+
+          if git merge-base --is-ancestor upstream/quattro origin/quattro; then
+            set_output "changed=false"
+            exit 0
+          fi
+
+          upstream_sha=$(git rev-parse upstream/quattro)
+          branch="automation/upstream-quattro-${upstream_sha:0:12}"
+          if git ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null; then
+            git fetch --no-tags origin "refs/heads/$branch:refs/remotes/origin/$branch"
+            git merge-base --is-ancestor origin/quattro "origin/$branch"
+            git merge-base --is-ancestor upstream/quattro "origin/$branch"
+            git switch --detach "origin/$branch"
+            set_output "changed=true" "branch=$branch" "upstream_sha=$upstream_sha" "push=false"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch" origin/quattro
+          git merge --no-ff --no-edit upstream/quattro
+          set_output "changed=true" "branch=$branch" "upstream_sha=$upstream_sha" "push=true"
+      - name: Run parity on merged candidate
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          UPSTREAM_REF: upstream/quattro
+        run: test/public-parity
+      - name: Push immutable sync branch
+        if: steps.sync.outputs.push == 'true'
+        env:
+          SYNC_BRANCH: ${{ steps.sync.outputs.branch }}
+        run: git push origin "HEAD:refs/heads/$SYNC_BRANCH"
+      - name: Open sync pull request
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SYNC_BRANCH: ${{ steps.sync.outputs.branch }}
+          UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
+        run: |
+          if (( $(gh pr list --state open --head "$SYNC_BRANCH" --json number --jq length) == 0 )); then
+            gh pr create \
+              --base quattro \
+              --head "$SYNC_BRANCH" \
+              --title "Merge canonical Quattro ${UPSTREAM_SHA:0:12}" \
+              --body "Automated merge of canonical Quattro at \`$UPSTREAM_SHA\`. The public parity gate passed on the exact merge candidate. This pull request does not auto-merge."
+          fi
