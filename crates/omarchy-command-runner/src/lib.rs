@@ -10,6 +10,42 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output};
 
+/// Return whether an immediate power-supply entry reports connected external power.
+///
+/// This mirrors `omarchy-power-present`: unreadable and malformed entries are ignored, only
+/// `Mains` and `USB` supplies qualify, and their `online` value must be exactly `1` after trailing
+/// newlines are removed.
+pub fn external_power_present(power_supply_path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(power_supply_path) else {
+        return false;
+    };
+
+    entries.filter_map(Result::ok).any(|entry| {
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            return false;
+        }
+        let supply = entry.path();
+        let Ok(supply_type) = std::fs::read(supply.join("type")) else {
+            return false;
+        };
+        let supply_type = trim_trailing_newlines(&supply_type);
+        if supply_type != b"Mains" && supply_type != b"USB" {
+            return false;
+        }
+
+        std::fs::read(supply.join("online"))
+            .map(|online| trim_trailing_newlines(&online) == b"1")
+            .unwrap_or(false)
+    })
+}
+
+fn trim_trailing_newlines(mut value: &[u8]) -> &[u8] {
+    while value.last() == Some(&b'\n') {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
 /// Whether an unavailable compatibility provider may use the existing command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderPolicy {
