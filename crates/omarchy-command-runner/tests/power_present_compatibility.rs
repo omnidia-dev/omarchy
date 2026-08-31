@@ -1,7 +1,10 @@
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+use support::{Invocation, assert_differential_match, observe, os};
 
 static TEST_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -42,29 +45,61 @@ fn repository_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn bash_result(root: &Path, extra_arguments: &[&str]) -> Output {
-    Command::new(repository_root().join("bin/omarchy-power-present"))
-        .args(extra_arguments)
+fn bash_invocation(root: &Path, extra_arguments: &[&str]) -> Invocation {
+    Invocation::new(repository_root().join("bin/omarchy-power-present"))
+        .args(extra_arguments.iter().map(os))
         .env("OMARCHY_POWER_SUPPLY_PATH", root)
-        .output()
-        .expect("run Bash power helper")
+        .current_dir(root)
 }
 
-fn rust_result(root: &Path, extra_arguments: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_omarchy-power-present-rs"))
-        .args(extra_arguments)
+fn rust_invocation(root: &Path, extra_arguments: &[&str]) -> Invocation {
+    Invocation::new(env!("CARGO_BIN_EXE_omarchy-power-present-rs"))
+        .args(extra_arguments.iter().map(os))
         .env("OMARCHY_POWER_SUPPLY_PATH", root)
-        .output()
-        .expect("run Rust power helper")
+        .current_dir(root)
 }
 
-fn assert_differential_match(fixture: &Fixture, extra_arguments: &[&str]) {
-    let bash = bash_result(&fixture.root, extra_arguments);
-    let rust = rust_result(&fixture.root, extra_arguments);
+fn assert_power_match(fixture: &Fixture, extra_arguments: &[&str]) {
+    assert_differential_match(
+        &bash_invocation(&fixture.root, extra_arguments),
+        &rust_invocation(&fixture.root, extra_arguments),
+    );
+}
 
-    assert_eq!(rust.status.code(), bash.status.code(), "exit status drift");
-    assert_eq!(rust.stdout, bash.stdout, "stdout drift");
-    assert_eq!(rust.stderr, bash.stderr, "stderr drift");
+#[test]
+fn harness_compares_argv_environment_working_directory_and_standard_streams() {
+    let directory = std::env::temp_dir();
+    let script = "printf '%s|%s|' \"$1\" \"$CORPUS_VALUE\"; pwd; printf 'stderr' >&2; exit 17";
+    let invocation = || {
+        Invocation::new("/bin/bash")
+            .args(["-c", script, "bash", "argument with spaces"])
+            .env("CORPUS_VALUE", "environment value")
+            .current_dir(&directory)
+    };
+
+    assert_differential_match(&invocation(), &invocation());
+    let observed = observe(&invocation()).unwrap();
+    assert_eq!(observed.exit_code, Some(17));
+    assert!(
+        observed
+            .stdout
+            .starts_with(b"argument with spaces|environment value|")
+    );
+    assert_eq!(observed.stderr, b"stderr");
+    assert!(!observed.timed_out);
+}
+
+#[test]
+fn harness_bounds_nonterminating_commands_and_reaps_them() {
+    let invocation = Invocation::new("/bin/bash")
+        .args(["-c", "while :; do :; done"])
+        .timeout(Duration::from_millis(50));
+    let started = Instant::now();
+
+    let observed = observe(&invocation).unwrap();
+
+    assert!(observed.timed_out);
+    assert!(started.elapsed() < Duration::from_secs(1));
 }
 
 #[test]
@@ -75,8 +110,13 @@ fn matches_connected_mains_and_usb_supplies() {
     ] {
         let fixture = Fixture::new(label);
         fixture.supply("AC0", supply_type, b"1\n");
-        assert_differential_match(&fixture, &[]);
-        assert!(rust_result(&fixture.root, &[]).status.success());
+        assert_power_match(&fixture, &[]);
+        assert_eq!(
+            observe(&rust_invocation(&fixture.root, &[]))
+                .unwrap()
+                .exit_code,
+            Some(0)
+        );
     }
 }
 
@@ -84,27 +124,27 @@ fn matches_connected_mains_and_usb_supplies() {
 fn matches_offline_battery_malformed_and_empty_inventories() {
     let offline = Fixture::new("offline");
     offline.supply("AC0", b"Mains\n", b"0\n");
-    assert_differential_match(&offline, &[]);
+    assert_power_match(&offline, &[]);
 
     let battery = Fixture::new("battery");
     battery.supply("BAT0", b"Battery\n", b"1\n");
-    assert_differential_match(&battery, &[]);
+    assert_power_match(&battery, &[]);
 
     let malformed = Fixture::new("malformed");
     malformed.supply("AC0", b"Mains \n", b"1\n");
-    assert_differential_match(&malformed, &[]);
+    assert_power_match(&malformed, &[]);
 
     let empty = Fixture::new("empty");
-    assert_differential_match(&empty, &[]);
+    assert_power_match(&empty, &[]);
 
     let hidden = Fixture::new("hidden");
     hidden.supply(".AC0", b"Mains\n", b"1\n");
-    assert_differential_match(&hidden, &[]);
+    assert_power_match(&hidden, &[]);
 }
 
 #[test]
 fn matches_multiple_trailing_newlines_and_ignored_arguments() {
     let fixture = Fixture::new("newlines-and-argv");
     fixture.supply("AC0", b"USB\n\n", b"1\n\n");
-    assert_differential_match(&fixture, &["ignored", "argument with spaces"]);
+    assert_power_match(&fixture, &["ignored", "argument with spaces"]);
 }
