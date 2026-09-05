@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""Exercise the checked sync scripts against disposable local Git remotes."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+
+WORKFLOW = Path(__file__).resolve().parents[1] / '.github/workflows/upstream-quattro-sync.yml'
+
+
+def block(name: str) -> str:
+    lines = WORKFLOW.read_text().splitlines()
+    start = lines.index('      - name: ' + name)
+    run = next(i for i in range(start + 1, len(lines)) if lines[i] == '        run: |')
+    body = []
+    for line in lines[run + 1:]:
+        if line and not line.startswith('          '):
+            break
+        body.append(line[10:] if line else '')
+    if not body:
+        raise AssertionError('missing executable workflow block: ' + name)
+    return '\n'.join(body) + '\n'
+
+
+def command(args, cwd, env, ok=True):
+    result = subprocess.run(args, cwd=cwd, env=env, capture_output=True, text=True, timeout=15)
+    if (result.returncode == 0) != ok:
+        raise AssertionError(f'{args[0]} exit={result.returncode}\n{result.stdout}\n{result.stderr}')
+    return result.stdout.strip()
+
+
+def main():
+    prepare = block('Prepare exact deterministic candidate')
+    publish = block('Reconstruct and publish only the exact validated Git object')
+    with tempfile.TemporaryDirectory(prefix='quattro-sync-protocol-') as directory:
+        root = Path(directory)
+        env = dict(os.environ, GIT_CONFIG_GLOBAL=str(root / 'gitconfig'), GIT_CONFIG_NOSYSTEM='1')
+        for key in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_CONFIG_COUNT'):
+            env.pop(key, None)
+        command(['git', 'config', '--global', 'user.name', 'sync-fixture'], root, env)
+        command(['git', 'config', '--global', 'user.email', 'fixture@example.invalid'], root, env)
+        command(['git', 'config', '--global', 'init.defaultBranch', 'quattro'], root, env)
+        origin = root / 'origin.git'
+        upstream = root / 'upstream.git'
+        for remote in (origin, upstream):
+            command(['git', 'init', '--bare', str(remote)], root, env)
+        command(['git', 'config', '--global', f'url.{upstream.as_uri()}.insteadOf',
+                 'https://github.com/omacom/omarchy.git'], root, env)
+        source = root / 'source'
+        command(['git', 'init', str(source)], root, env)
+        (source / 'root').write_text('common\n')
+        (source / 'test').mkdir()
+        (source / 'test/public-parity').write_text('#!/bin/bash\necho forbidden > publisher-executed-code\nexit 1\n')
+        (source / 'test/public-parity').chmod(0o755)
+        command(['git', 'add', '.'], source, env)
+        command(['git', 'commit', '-m', 'common'], source, env)
+        common = command(['git', 'rev-parse', 'HEAD'], source, env)
+        (source / 'fork').write_text('fork\n')
+        command(['git', 'add', '.'], source, env)
+        command(['git', 'commit', '-m', 'fork'], source, env)
+        command(['git', 'push', str(origin), 'HEAD:refs/heads/quattro'], source, env)
+        command(['git', 'checkout', '--detach', common], source, env)
+        (source / 'upstream').write_text('upstream\n')
+        command(['git', 'add', '.'], source, env)
+        command(['git', 'commit', '-m', 'upstream'], source, env)
+        command(['git', 'push', str(upstream), 'HEAD:refs/heads/quattro'], source, env)
+        validation = root / 'validation'
+        command(['git', 'clone', '--branch', 'quattro', str(origin), str(validation)], root, env)
+        command(['git', 'remote', 'add', 'upstream', 'https://github.com/omacom/omarchy.git'], validation, env)
+        command(['git', 'fetch', '--no-tags', 'upstream', 'quattro:refs/remotes/upstream/quattro'], validation, env)
+        output = root / 'outputs'
+        command(['bash', '-euo', 'pipefail', '-c', prepare], validation,
+                dict(env, GITHUB_OUTPUT=str(output)))
+        facts = dict(line.split('=', 1) for line in output.read_text().splitlines())
+        assert facts['changed'] == 'true'
+        assert command(['git', 'show', '-s', '--format=%P', facts['candidate_sha']], validation, env) == (
+            facts['base_sha'] + ' ' + facts['upstream_sha'])
+        tools = root / 'tools'
+        tools.mkdir()
+        (tools / 'gh').write_text('''#!/usr/bin/env python3
+import json, os, pathlib, sys
+log = pathlib.Path(os.environ['GH_FIXTURE_LOG'])
+args = sys.argv[1:]
+if args[:2] == ['pr', 'list']:
+    print('1' if log.exists() else '0')
+elif args[:2] == ['pr', 'create']:
+    log.write_text(json.dumps(args))
+else:
+    sys.exit('unexpected gh operation')
+''')
+        (tools / 'gh').chmod(0o755)
+        log = root / 'gh-log'
+        summary = root / 'summary'
+        base_env = dict(env, PATH=str(tools) + os.pathsep + env['PATH'],
+                        GH_FIXTURE_LOG=str(log), GH_TOKEN='synthetic-fixture-token',
+                        GITHUB_STEP_SUMMARY=str(summary),
+                        **{key.upper(): value for key, value in facts.items() if key != 'changed'})
+        attempt = 0
+
+        def run_publish(overrides=None, ok=True):
+            nonlocal attempt
+            attempt += 1
+            checkout = root / f'publisher-{attempt}'
+            command(['git', 'clone', '--branch', 'quattro', str(origin), str(checkout)], root, env)
+            command(['bash', '-euo', 'pipefail', '-c', publish], checkout,
+                    dict(base_env, **(overrides or {})), ok=ok)
+            assert not (checkout / 'publisher-executed-code').exists()
+
+        run_publish()
+        branch = 'automation/upstream-quattro-' + facts['base_sha'][:12] + '-' + facts['upstream_sha'][:12]
+        ref = 'refs/heads/' + branch
+        assert command(['git', '--git-dir', str(origin), 'rev-parse', ref], root, env) == facts['candidate_sha']
+        first_pr = log.read_bytes()
+        assert json.loads(first_pr)[:2] == ['pr', 'create']
+        run_publish()
+        assert log.read_bytes() == first_pr
+        for field in ('BASE_SHA', 'UPSTREAM_SHA', 'CANDIDATE_SHA', 'TREE_SHA'):
+            run_publish({field: common}, ok=False)
+        run_publish({'CANDIDATE_SHA': 'not-a-git-identity'}, ok=False)
+        assert command(['git', '--git-dir', str(origin), 'rev-parse', ref], root, env) == facts['candidate_sha']
+        command(['git', '--git-dir', str(origin), 'update-ref', ref, common], root, env)
+        run_publish(ok=False)
+        assert command(['git', '--git-dir', str(origin), 'rev-parse', ref], root, env) == common
+        assert log.read_bytes() == first_pr
+        print('upstream_sync_protocol_tests=pass (exact publication, replay, four identity substitutions, malformed identity, branch collision)')
+
+
+if __name__ == '__main__':
+    main()

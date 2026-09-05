@@ -1,0 +1,21 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT=$(git rev-parse --show-toplevel)
+UPSTREAM_REF=${UPSTREAM_REF:-upstream/quattro}
+export UPSTREAM_REF
+cd "$ROOT"
+git rev-parse --verify "$UPSTREAM_REF^{commit}" >/dev/null
+
+RUSTC_WRAPPER= cargo +1.95.0 fmt --all -- --check
+RUSTC_WRAPPER= cargo +1.95.0 clippy --locked --all-targets -- -D warnings
+RUSTC_WRAPPER= cargo +1.95.0 test --locked -p omarchy-command-runner
+bash test/shell.d/power-present-test.sh
+bash test/public-content-audit-test
+bash test/public-content-audit
+git diff --check "$UPSTREAM_REF"...HEAD
+git diff --exit-code HEAD
+
+printf 'upstream_source=%s\n' "$(git rev-parse "$UPSTREAM_REF")"
+printf 'candidate_source=%s\n' "$(git rev-parse HEAD)"
+echo 'public_parity=pass'

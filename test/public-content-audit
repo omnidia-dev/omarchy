@@ -1,0 +1,36 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT=$(git rev-parse --show-toplevel)
+UPSTREAM_REF=${UPSTREAM_REF:-upstream/quattro}
+cd "$ROOT"
+git rev-parse --verify "$UPSTREAM_REF^{commit}" >/dev/null
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+
+# Preserve every filename and propagate discovery failures before scanning.
+git diff --name-only -z --diff-filter=ACMR "$UPSTREAM_REF"...HEAD >"$scratch/paths"
+mapfile -d '' -t changed_paths <"$scratch/paths"
+if (( ${#changed_paths[@]} > 0 )); then
+  forbidden_pattern=$(printf '%s|' \
+    'omni''dia' \
+    'propr''ietary' \
+    'private[ _-](api|identity|topology|path|credential)' \
+    'road''map' \
+    '/work''spaces/' \
+    '/ho''me/')
+  forbidden_pattern=${forbidden_pattern%|}
+  if git --literal-pathspecs grep -nEi "$forbidden_pattern" HEAD -- "${changed_paths[@]}" >"$scratch/matches"; then
+    cat "$scratch/matches" >&2
+    echo 'Public-content audit rejected a downstream-only term' >&2
+    exit 1
+  else
+    status=$?
+    if (( status != 1 )); then
+      echo "Public-content scanner failed with status $status" >&2
+      exit "$status"
+    fi
+  fi
+fi
+
+echo 'public_content_audit=pass'

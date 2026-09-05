@@ -1,0 +1,49 @@
+name: Public parity
+
+"on":
+  pull_request:
+  push:
+    branches:
+      - quattro
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  parity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check workflow syntax and publication protocol
+        shell: bash --noprofile --norc -euo pipefail {0}
+        run: |
+          tools=$(mktemp -d)
+          trap 'rm -rf "$tools"' EXIT
+          curl --fail --location --silent --show-error --proto '=https' \
+            --output "$tools/actionlint.tar.gz" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          printf '%s  %s\n' \
+            8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8 \
+            "$tools/actionlint.tar.gz" | sha256sum --check -
+          tar --extract --gzip --no-same-owner --no-same-permissions \
+            --file "$tools/actionlint.tar.gz" --directory "$tools" actionlint
+          "$tools/actionlint" -color \
+            .github/workflows/public-parity.yml .github/workflows/upstream-quattro-sync.yml
+          python3 test/upstream-sync-protocol-test
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
+      - name: Fetch canonical Quattro
+        run: |
+          git remote add upstream https://github.com/omacom/omarchy.git
+          git fetch --no-tags upstream quattro:refs/remotes/upstream/quattro
+      - name: Run public parity gate
+        env:
+          UPSTREAM_REF: upstream/quattro
+        run: test/public-parity
