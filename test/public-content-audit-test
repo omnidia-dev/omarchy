@@ -1,0 +1,60 @@
+#!/bin/bash
+set -euo pipefail
+
+audit=$(cd "$(dirname "$0")" && pwd)/public-content-audit
+REAL_GIT=$(command -v git)
+export REAL_GIT
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+cd "$scratch"
+git init -q
+git config user.name parity-test
+git config user.email parity-test@example.invalid
+printf 'public baseline\n' > baseline
+git add baseline
+git commit -qm baseline
+export UPSTREAM_REF=HEAD
+bash "$audit" >/dev/null
+export UPSTREAM_REF
+authority=$(git rev-parse HEAD)
+UPSTREAM_REF=$authority
+printf 'public addition\n' > 'file with spaces'
+git add .
+git commit -qm addition
+bash "$audit" >/dev/null
+
+# A matching committed file must fail even with whitespace in its name.
+printf '%s\n' 'propr''ietary' > 'file with spaces'
+git add .
+git commit -qm rejected
+if bash "$audit" >/dev/null 2>&1; then
+  echo 'matching content unexpectedly passed' >&2
+  exit 1
+fi
+printf 'public addition\n' > 'file with spaces'
+git add .
+git commit -qm restored
+
+# Scanner errors must not be confused with the no-match exit status.
+mkdir fake-bin
+cat > fake-bin/git <<'WRAPPER'
+#!/bin/bash
+for arg in "$@"; do
+  if [[ $arg == "grep" ]]; then
+    exit 2
+  fi
+done
+exec "$REAL_GIT" "$@"
+WRAPPER
+chmod +x fake-bin/git
+if PATH="$scratch/fake-bin:$PATH" bash "$audit" >/dev/null 2>&1; then
+  echo 'scanner error unexpectedly passed' >&2
+  exit 1
+fi
+UPSTREAM_REF=missing-reference
+if bash "$audit" >/dev/null 2>&1; then
+  echo 'missing base unexpectedly passed' >&2
+  exit 1
+fi
+
+echo 'public_content_audit_tests=pass'

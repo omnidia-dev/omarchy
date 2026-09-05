@@ -10,74 +10,124 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
 
 jobs:
-  prepare-sync:
+  validate:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    outputs:
+      changed: ${{ steps.candidate.outputs.changed }}
+      base_sha: ${{ steps.candidate.outputs.base_sha }}
+      upstream_sha: ${{ steps.candidate.outputs.upstream_sha }}
+      candidate_sha: ${{ steps.candidate.outputs.candidate_sha }}
+      tree_sha: ${{ steps.candidate.outputs.tree_sha }}
     steps:
-      - name: Check out fork Quattro
+      - name: Check out fork Quattro without retained credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: quattro
           fetch-depth: 0
-      - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
+          persist-credentials: false
       - name: Fetch canonical Quattro
         run: |
           git remote add upstream https://github.com/omacom/omarchy.git
           git fetch --no-tags upstream quattro:refs/remotes/upstream/quattro
-      - name: Prepare exact upstream merge
-        id: sync
+      - name: Prepare exact deterministic candidate
+        id: candidate
         run: |
-          set_output() {
-            printf '%s\n' "$@" >>"$GITHUB_OUTPUT"
-          }
-
-          if git merge-base --is-ancestor upstream/quattro origin/quattro; then
-            set_output "changed=false"
-            exit 0
-          fi
-
+          base_sha=$(git rev-parse origin/quattro)
           upstream_sha=$(git rev-parse upstream/quattro)
-          branch="automation/upstream-quattro-${upstream_sha:0:12}"
-          if git ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null; then
-            git fetch --no-tags origin "refs/heads/$branch:refs/remotes/origin/$branch"
-            git merge-base --is-ancestor origin/quattro "origin/$branch"
-            git merge-base --is-ancestor upstream/quattro "origin/$branch"
-            git switch --detach "origin/$branch"
-            set_output "changed=true" "branch=$branch" "upstream_sha=$upstream_sha" "push=false"
+          if git merge-base --is-ancestor "$upstream_sha" "$base_sha"; then
+            echo 'changed=false' >>"$GITHUB_OUTPUT"
             exit 0
           fi
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git switch -c "$branch" origin/quattro
-          git merge --no-ff --no-edit upstream/quattro
-          set_output "changed=true" "branch=$branch" "upstream_sha=$upstream_sha" "push=true"
-      - name: Run parity on merged candidate
-        if: steps.sync.outputs.changed == 'true'
+          merge_result=$(git merge-tree --write-tree "$base_sha" "$upstream_sha")
+          tree_sha=${merge_result%%$'\n'*}
+          [[ $tree_sha =~ ^[0-9a-f]{40}$ ]]
+          export GIT_AUTHOR_NAME='github-actions[bot]'
+          export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+          export GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com'
+          export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+          GIT_AUTHOR_DATE=$(git show -s --format=%cI "$upstream_sha")
+          export GIT_AUTHOR_DATE GIT_COMMITTER_DATE="$GIT_AUTHOR_DATE"
+          candidate_sha=$(git -c commit.gpgsign=false commit-tree "$tree_sha" \
+            -p "$base_sha" -p "$upstream_sha" -m "Merge canonical Quattro $upstream_sha")
+          git -c core.hooksPath=/dev/null switch --detach "$candidate_sha"
+          printf '%s\n' 'changed=true' "base_sha=$base_sha" \
+            "upstream_sha=$upstream_sha" "candidate_sha=$candidate_sha" \
+            "tree_sha=$tree_sha" >>"$GITHUB_OUTPUT"
+      - name: Install pinned Rust toolchain
+        if: steps.candidate.outputs.changed == 'true'
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
+      - name: Run candidate parity without write credentials
+        if: steps.candidate.outputs.changed == 'true'
         env:
-          UPSTREAM_REF: upstream/quattro
+          UPSTREAM_REF: ${{ steps.candidate.outputs.upstream_sha }}
         run: test/public-parity
-      - name: Push immutable sync branch
-        if: steps.sync.outputs.push == 'true'
+
+  publish:
+    needs: validate
+    if: needs.validate.result == 'success' && needs.validate.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Fetch Git objects without retaining credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: quattro
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Reconstruct and publish only the exact validated Git object
         env:
-          SYNC_BRANCH: ${{ steps.sync.outputs.branch }}
-        run: git push origin "HEAD:refs/heads/$SYNC_BRANCH"
-      - name: Open sync pull request
-        if: steps.sync.outputs.changed == 'true'
-        env:
+          BASE_SHA: ${{ needs.validate.outputs.base_sha }}
+          UPSTREAM_SHA: ${{ needs.validate.outputs.upstream_sha }}
+          CANDIDATE_SHA: ${{ needs.validate.outputs.candidate_sha }}
+          TREE_SHA: ${{ needs.validate.outputs.tree_sha }}
           GH_TOKEN: ${{ github.token }}
-          SYNC_BRANCH: ${{ steps.sync.outputs.branch }}
-          UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
         run: |
-          if (( $(gh pr list --state open --head "$SYNC_BRANCH" --json number --jq length) == 0 )); then
-            gh pr create \
-              --base quattro \
-              --head "$SYNC_BRANCH" \
-              --title "Merge canonical Quattro ${UPSTREAM_SHA:0:12}" \
-              --body "Automated merge of canonical Quattro at \`$UPSTREAM_SHA\`. The public parity gate passed on the exact merge candidate. This pull request does not auto-merge."
+          # Never execute candidate scripts, builds, hooks, or artifact payloads here.
+          for value in "$BASE_SHA" "$UPSTREAM_SHA" "$CANDIDATE_SHA" "$TREE_SHA"; do
+            [[ $value =~ ^[0-9a-f]{40}$ ]]
+          done
+          git remote add upstream https://github.com/omacom/omarchy.git
+          git fetch --no-tags upstream quattro:refs/remotes/upstream/quattro
+          [[ $(git rev-parse origin/quattro) == "$BASE_SHA" ]]
+          [[ $(git rev-parse upstream/quattro) == "$UPSTREAM_SHA" ]]
+          merge_result=$(git merge-tree --write-tree "$BASE_SHA" "$UPSTREAM_SHA")
+          observed_tree=${merge_result%%$'\n'*}
+          [[ $observed_tree == "$TREE_SHA" ]]
+          export GIT_AUTHOR_NAME='github-actions[bot]'
+          export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+          export GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com'
+          export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+          GIT_AUTHOR_DATE=$(git show -s --format=%cI "$UPSTREAM_SHA")
+          export GIT_AUTHOR_DATE GIT_COMMITTER_DATE="$GIT_AUTHOR_DATE"
+          observed_commit=$(git -c commit.gpgsign=false commit-tree "$TREE_SHA" \
+            -p "$BASE_SHA" -p "$UPSTREAM_SHA" -m "Merge canonical Quattro $UPSTREAM_SHA")
+          [[ $observed_commit == "$CANDIDATE_SHA" ]]
+          branch="automation/upstream-quattro-${BASE_SHA:0:12}-${UPSTREAM_SHA:0:12}"
+          if remote=$(git ls-remote --exit-code --heads origin "refs/heads/$branch"); then
+            [[ ${remote%%$'\t'*} == "$CANDIDATE_SHA" ]]
+          else
+            status=$?
+            (( status == 2 ))
+            git -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
+              push origin "$CANDIDATE_SHA:refs/heads/$branch"
           fi
+          # Branch creation never implies automatic check execution or merge approval.
+          if (( $(gh pr list --state open --base quattro --head "$branch" --json number --jq length) == 0 )); then
+            gh pr create --base quattro --head "$branch" \
+              --title "Merge canonical Quattro ${UPSTREAM_SHA:0:12}" \
+              --body "Read-only parity passed for exact candidate \`$CANDIDATE_SHA\`, tree \`$TREE_SHA\`, base \`$BASE_SHA\`, upstream \`$UPSTREAM_SHA\`. Publication independently reconstructed the same object without executing candidate code. Follow-on Actions may require approval; inspect their current state. This PR never auto-merges."
+          fi
+          printf '%s\n' "Published candidate: $CANDIDATE_SHA" \
+            'Follow-on PR workflows may require approval; missing or pending checks are not a pass.' \
+            >>"$GITHUB_STEP_SUMMARY"
