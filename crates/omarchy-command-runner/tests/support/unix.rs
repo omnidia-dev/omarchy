@@ -17,7 +17,9 @@ pub(super) fn observe(invocation: &Invocation) -> io::Result<Observation> {
     let deadline = Instant::now()
         .checked_add(invocation.timeout)
         .filter(|_| !invocation.timeout.is_zero())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid observation deadline"))?;
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid observation deadline")
+        })?;
     let (mut stdout, stdout_child) = UnixStream::pair()?;
     let (mut stderr, stderr_child) = UnixStream::pair()?;
     stdout.set_nonblocking(true)?;
@@ -107,7 +109,9 @@ fn drain(stream: &mut UnixStream, captured: &mut Vec<u8>) -> io::Result<bool> {
                 if count > MAX_CAPTURE_BYTES - captured.len() {
                     return Err(io::Error::other("command capture exceeded its byte limit"));
                 }
-                captured.try_reserve_exact(count).map_err(io::Error::other)?;
+                captured
+                    .try_reserve_exact(count)
+                    .map_err(io::Error::other)?;
                 captured.extend_from_slice(&buffer[..count]);
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),

@@ -21,10 +21,8 @@ fn descendant_held_output_cannot_bypass_the_observation_deadline() {
 
 #[test]
 fn oversized_output_is_an_error_not_a_truncated_success() {
-    let error = observe(
-        &invocation("printf '%02000000d' 0").timeout(Duration::from_secs(2)),
-    )
-    .unwrap_err();
+    let error =
+        observe(&invocation("printf '%02000000d' 0").timeout(Duration::from_secs(2))).unwrap_err();
     assert!(error.to_string().contains("byte limit"));
 }
 
