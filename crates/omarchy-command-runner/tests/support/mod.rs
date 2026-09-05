@@ -1,9 +1,10 @@
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Read};
+use std::io;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+#[cfg(unix)]
+mod unix;
 
 #[derive(Debug, Clone)]
 pub struct Invocation {
@@ -59,55 +60,32 @@ pub struct Observation {
 }
 
 pub fn observe(invocation: &Invocation) -> io::Result<Observation> {
-    let mut command = Command::new(&invocation.program);
-    command
-        .args(&invocation.arguments)
-        .envs(invocation.environment.iter().cloned())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(current_directory) = &invocation.current_directory {
-        command.current_dir(current_directory);
+    #[cfg(unix)]
+    {
+        unix::observe(invocation)
     }
-
-    let mut child = command.spawn()?;
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
-    let stdout_reader = thread::spawn(move || read_all(stdout));
-    let stderr_reader = thread::spawn(move || read_all(stderr));
-    let deadline = Instant::now() + invocation.timeout;
-    let (status, timed_out) = loop {
-        if let Some(status) = child.try_wait()? {
-            break (status, false);
-        }
-        if Instant::now() >= deadline {
-            child.kill()?;
-            break (child.wait()?, true);
-        }
-        thread::sleep(Duration::from_millis(2));
-    };
-
-    Ok(Observation {
-        exit_code: status.code(),
-        stdout: stdout_reader
-            .join()
-            .expect("stdout reader thread did not panic")?,
-        stderr: stderr_reader
-            .join()
-            .expect("stderr reader thread did not panic")?,
-        timed_out,
-    })
+    #[cfg(not(unix))]
+    {
+        let _ = invocation;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the command corpus currently requires Unix process groups",
+        ))
+    }
 }
 
 pub fn assert_differential_match(existing: &Invocation, candidate: &Invocation) {
     let existing = observe(existing).expect("observe existing command");
     let candidate = observe(candidate).expect("observe candidate command");
+    assert!(
+        !existing.timed_out && !candidate.timed_out,
+        "timeouts cannot qualify command parity"
+    );
+    assert!(
+        existing.exit_code.is_some() && candidate.exit_code.is_some(),
+        "signal termination cannot qualify command parity"
+    );
     assert_eq!(candidate, existing, "command behavior drift");
-}
-
-fn read_all(mut pipe: impl Read) -> io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    pipe.read_to_end(&mut bytes)?;
-    Ok(bytes)
 }
 
 pub fn os(value: impl AsRef<OsStr>) -> OsString {

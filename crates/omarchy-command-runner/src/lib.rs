@@ -5,6 +5,8 @@
 //! current command as the fallback until a separate migration qualifies a Rust
 //! replacement.
 
+mod fallback;
+
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -234,6 +236,7 @@ impl CompatibilityCommand {
             ));
         }
 
+        let absent_before_start = fallback::executable_is_absent(provider.program());
         match run(provider) {
             Ok(value) => Ok(CommandResult {
                 origin: CommandOrigin::Provider,
@@ -241,7 +244,9 @@ impl CompatibilityCommand {
             }),
             Err(error)
                 if error.kind() == io::ErrorKind::NotFound
-                    && self.provider_policy == ProviderPolicy::Optional =>
+                    && self.provider_policy == ProviderPolicy::Optional
+                    && absent_before_start
+                    && fallback::executable_is_absent(provider.program()) =>
             {
                 run(&self.existing).map(|value| CommandResult {
                     origin: CommandOrigin::Existing,
