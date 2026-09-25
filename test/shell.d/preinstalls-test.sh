@@ -36,7 +36,9 @@ SH
 
 chmod +x "$mock_bin"/*
 
-export PATH="$mock_bin:$PATH"
+# $ROOT/bin after the mocks, so the real helpers answer wherever a mock does not
+# shadow them.
+export PATH="$mock_bin:$ROOT/bin:$PATH"
 export HOME="$test_home"
 export OMARCHY_TEST_PKG_LOG="$pkg_log"
 
