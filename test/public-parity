@@ -11,6 +11,7 @@ RUSTC_WRAPPER= cargo +1.95.0 fmt --all -- --check
 RUSTC_WRAPPER= cargo +1.95.0 clippy --locked --all-targets -- -D warnings
 RUSTC_WRAPPER= cargo +1.95.0 test --locked -p omarchy-command-runner
 bash test/shell.d/power-present-test.sh
+bash test/shell.d/omarchy-kernel-migration-test.sh
 bash test/public-content-audit-test
 bash test/public-content-audit
 git diff --check "$UPSTREAM_REF"...HEAD
