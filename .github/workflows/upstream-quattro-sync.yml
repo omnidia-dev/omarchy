@@ -123,8 +123,11 @@ jobs:
               push origin "$CANDIDATE_SHA:refs/heads/$branch"
           fi
           # Branch creation never implies automatic check execution or merge approval.
-          if (( $(gh pr list --state open --base quattro --head "$branch" --json number --jq length) == 0 )); then
-            gh pr create --base quattro --head "$branch" \
+          # The canonical upstream remote is not the publication repository.
+          open_pr_count=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --base quattro --head "$branch" --json number --jq length)
+          [[ $open_pr_count =~ ^(0|[1-9][0-9]*)$ ]]
+          if [[ $open_pr_count == "0" ]]; then
+            gh pr create --repo "$GITHUB_REPOSITORY" --base quattro --head "$branch" \
               --title "Merge canonical Quattro ${UPSTREAM_SHA:0:12}" \
               --body "Read-only parity passed for exact candidate \`$CANDIDATE_SHA\`, tree \`$TREE_SHA\`, base \`$BASE_SHA\`, upstream \`$UPSTREAM_SHA\`. Publication independently reconstructed the same object without executing candidate code. Follow-on Actions may require approval; inspect their current state. This PR never auto-merges."
           fi
