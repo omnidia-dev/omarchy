@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   parity:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.CI_RUNNER_ROUTES || '{}')['ubuntu-24.04'] || 'ubuntu-24.04' }}
     timeout-minutes: 20
     steps:
       - name: Check out exact candidate
